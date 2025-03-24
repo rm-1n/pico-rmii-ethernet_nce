@@ -1,5 +1,22 @@
 cmake_minimum_required(VERSION 3.12)
 
+# Pass in board type, via: cmake -DPICO_BOARD=board_type
+# Some board types are: pico, pico2, pimoroni_pico_plus2_rp2350
+#if(PICO_BOARD)
+#    set(PICO_BOARD ${PICO_BOARD})
+#else()
+#    set(PICO_BOARD "pico")
+#endif()
+
+#message(STATUS "PICO_BOARD: ${PICO_BOARD}")
+
+#set(PICO_BOARD "pico")
+#set(PICO_BOARD "pico2")
+#set(PICO_BOARD "pimoroni_pico_plus2_rp2350")
+
+# set(PICO_PLATFORM rp2350)
+# set(PICO_NUM_GPIOS 48)
+
 # initialize pico_sdk from GIT
 # (note this can come from environment, CMake cache etc)
 # set(PICO_SDK_FETCH_FROM_GIT on)
@@ -15,6 +32,9 @@ pico_sdk_init()
 
 # Use DECStation2040 pin definitions 
 add_definitions(-DDECSTATION2040)
+
+# Enable 1.8v threshold for pads
+#add_definitions(-DEN_1V8)
 
 #set(LWIP_PATH ${CMAKE_CURRENT_LIST_DIR}/lib/lwip)
 set(LWIP_PATH "${PICO_SDK_PATH}/lib/lwip")
@@ -54,8 +74,6 @@ target_sources(pico_lwip INTERFACE
 
     ${LWIP_PATH}/src/apps/http/httpd.c
     ${LWIP_PATH}/src/apps/http/fs.c
-
-    ${LWIP_PATH}/src/apps/lwiperf/lwiperf.c
 
     ${CMAKE_CURRENT_LIST_DIR}/src/lwip/sys_arch.c
 )

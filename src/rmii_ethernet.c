@@ -14,6 +14,8 @@
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
 
+#include "hardware/sync.h" 
+
 // For setting 1.8v threshold
 #include "hardware/vreg.h"
 #include "hardware/regs/addressmap.h"
@@ -28,15 +30,27 @@
 #include "lwip/timeouts.h"
 
 #include "rmii_ethernet_phy_rx.pio.h"
+
+// Select source of RMII clk: tx PIO program or LAN8720a module
+// Edit rmii_ethernet_phy_rx.pio undefine/define the variable below
+#ifdef GENERATE_RMII_CLK
 #include "rmii_ethernet_phy_tx.pio.h"
+#else
+#include "rmii_ethernet_phy_tx_ext.pio.h"
+#endif
+
 #include "rmii_ethernet/netif.h"
 
+// Uncomment to enable setting I/O thresholds to 1.8v
+#define EN_1V8
+
+// Select PIO to use for Ethernet
 #define PICO_RMII_ETHERNET_PIO        pio0
 
 // Uncomment to set MAC address
 //#define PICO_RMII_ETHERNET_MAC_ADDR   {0xb8, 0x27, 0xeb, 0xde, 0xad, 0x00}
 
-// Need to hold at least two full Ethernet frames
+// Should be able to double buffer at least two full Ethernet frames
 #define RX_BUF_SIZE_POW 12
 #define RX_BUF_SIZE (1 << RX_BUF_SIZE_POW)
 #define RX_BUF_MASK (RX_BUF_SIZE - 1)
@@ -48,7 +62,9 @@ static volatile uint8_t rx_ring[RX_BUF_SIZE] __attribute__((aligned (RX_BUF_SIZE
 // Pointers to packets in the RX ring
 // Needs to be large enough to hold the expected number of packets
 // received while processing a max sized packet 
-#define RX_NUM_PTR_POW 5
+// The default assumption is that the receive buffer will contain
+// 64 byte packets so we can just divide buffer size by 64 (i.e. 2^6)
+#define RX_NUM_PTR_POW (RX_BUF_SIZE_POW - 6)
 #define RX_NUM_PTR (1 << RX_NUM_PTR_POW)
 #define RX_NUM_MASK (RX_NUM_PTR - 1)
 
@@ -73,8 +89,6 @@ static uint32_t rx_prev_pkt_ptr = 0;
 //    6         6        2      1500     4 = 1518
 //
 // For full overlap, need to hold at least two full 1518 byte Ethernet frames
-// Seems to work for LWIP with just one frame of buffering - still allows
-// overlap of transmit and filling of transmit buffer
 // Specify size in bytes, so 4096 is 2^12
 #define TX_BUF_SIZE_POW 12
 #define TX_BUF_SIZE (1 << TX_BUF_SIZE_POW)
@@ -87,12 +101,11 @@ static volatile uint8_t tx_ring[TX_BUF_SIZE] __attribute__((aligned (TX_BUF_SIZE
 // Pointers to length of the packets in the TX ring
 // Should be enough to hold the maximum number of minimum sized packets
 // i.e. 4096/64 = 64 * 4 bytes, or 2^(6 + 2)
-// LWIP doesn't seem to use that many, so 16 pointers are sufficient
-// (verified by sending ping packets with -s 10400).
-#define TX_NUM_PTR_POW (4 + 2)
-#define TX_NUM_PTR_BYTES (1 << TX_NUM_PTR_POW)
-#define TX_NUM_PTR (1 << (TX_NUM_PTR_POW - 2))
+#define TX_NUM_PTR_POW (TX_BUF_SIZE_POW - 6)
+#define TX_NUM_PTR (1 << TX_NUM_PTR_POW)
 #define TX_NUM_MASK (TX_NUM_PTR - 1)
+// Above, in bytes
+#define TX_NUM_PTR_POW_BYTES (TX_NUM_PTR_POW + 2)
 
 // Holds transmit packet length
 // Must be aligned to be used as a ring buffer
@@ -109,13 +122,11 @@ static uint tx_sm_offset;
 
 static int rx_dma_chan;
 static int rx_chain_chan;
-static int ipg_dma_chan;
 static int tx_dma_chan;
 static int tx_chain_chan;
 
 static dma_channel_config rx_dma_channel_config;
 static dma_channel_config rx_chain_channel_config;
-static dma_channel_config ipg_dma_channel_config;
 static dma_channel_config tx_dma_channel_config;
 static dma_channel_config tx_chain_channel_config;
 
@@ -124,11 +135,8 @@ static dma_channel_config pbuf_rx_channel_config;
 static dma_channel_config pbuf_tx_channel_config;
 static dma_channel_config pbuf_tx_no_inc_channel_config;
 
-// Reload RX DMA engine after this many bytes 
-static uint32_t rx_packet_size = RX_BUF_SIZE;
-
-// Capture Tx DMA read pointer during IPG
-static volatile uint32_t ipg_tx_rd_addr;
+// Reload the RX DMA engine with this value
+uint32_t rx_ctl_reload;
 
 // LAN8720 PHY address
 int phy_address = 0xffff;
@@ -181,13 +189,15 @@ static uint32_t crc32Lookup[256] =
 };
 #endif
 
+uint32_t count = 10;
 
 // Fetch data from ring buffer, calculate CRC, write data to destination pbuf
 // Return length (valid) or zero (invalid CRC)
-static uint ethernet_frame_to_pbuf(volatile uint8_t *data, 
-				   struct pbuf *buf,
-				   int len, int addr) {
-
+static uint __not_in_flash_func(ethernet_frame_to_pbuf)
+     (volatile uint8_t *data, 
+      struct pbuf *buf,
+      int len, int addr) {
+  
   uint crc = 0xffffffff;  /* Initial value. */
   uint index = 0;
   uint inverted_crc;
@@ -205,7 +215,7 @@ static uint ethernet_frame_to_pbuf(volatile uint8_t *data,
   dma_hw->sniff_data = 0xffffffff;
 #endif
 
-  // This is from LWIP pbuf.c, pbuf_take(...)
+  // This is from LWIP's pbuf.c, pbuf_take(...) routine
   for (p = buf; total_copy_len != 0; p = p->next) {
     wr_ptr = (uint8_t *)p->payload;
 
@@ -267,9 +277,10 @@ static uint ethernet_frame_to_pbuf(volatile uint8_t *data,
 // Copy packet data to ring buffer, adding pkt len, and CRC, for transmission
 // Assumes space availability check done before calling this function
 // Returns final length, including pkt len and CRC
-static uint ethernet_frame_copy_ring_pbuf(volatile uint8_t *data, 
-					  struct pbuf *p,
-					  int addr) {
+static uint __not_in_flash_func(ethernet_frame_copy_ring_pbuf)
+     (volatile uint8_t *data, 
+      struct pbuf *p,
+      int addr) {
   uint crc = 0xffffffff;  /* Initial value. */
   uint inverted_crc;
   uint8_t buf_dat;
@@ -284,6 +295,10 @@ static uint ethernet_frame_copy_ring_pbuf(volatile uint8_t *data,
   dma_channel_wait_for_finish_blocking(pbuf_chan);
   dma_hw->sniff_data = 0xffffffff;
 #endif
+
+  // Add length parameter space to start of buffer
+  uint32_t p_addr = addr;
+  addr = (addr + 2) & TX_BUF_MASK;
 
   // Get the payload from lwip, generating CRC along the way
   for (struct pbuf *q = p; q != NULL; q = q->next) {
@@ -334,6 +349,8 @@ static uint ethernet_frame_copy_ring_pbuf(volatile uint8_t *data,
 
 #ifdef USE_DMA_CRC
   // Make sure we have enough bytes to meet minimum packet size, minus CRC
+  // Note that we push the fill bytes through the DMA engine in order
+  // to include them in the DMA sniffer CRC calculation
   if (tot_len < 60) {
     uint32_t zero = 0;
     uint32_t remainder = 60 - tot_len;
@@ -366,6 +383,17 @@ static uint ethernet_frame_copy_ring_pbuf(volatile uint8_t *data,
 
   // Add CRC len
   tot_len += 4;
+
+  // Compute packet length dibits - 1 for PIO transmit loop
+  uint16_t pkt_len = (tot_len * 4) - 1;
+
+  // Save packet length for PIO transmit at start of packet
+  data[p_addr] = pkt_len;
+  p_addr = (p_addr + 1) & TX_BUF_MASK;
+  data[p_addr] = pkt_len >> 8;
+
+  // Add parameter len to buffer occupancy
+  tot_len += 2;
 
   return tot_len;
 }
@@ -540,7 +568,7 @@ static void md_sm() {
     md_pin_state = MD_WRITE;
     break;
 
-    // Done with reg address, start turn around
+    // Done with reg address, start data phase turn around
   case MD_REG_ADDR:
     md_state = MD_TURN;
     md_data = 0b00;
@@ -548,6 +576,7 @@ static void md_sm() {
     md_pin_state = md_rd_wr;
     break;
 
+    // Done with data phase turn around, start data phase
   case MD_TURN:
     md_state = MD_DATA;
     md_data = md_wr_data;
@@ -555,6 +584,7 @@ static void md_sm() {
     md_pin_state = md_rd_wr;
     break;
 
+    // Done with data phase, start idle
   case MD_DATA:
     md_state = MD_IDLE;
     md_data = 0;
@@ -649,17 +679,19 @@ void netif_rmii_ethernet_mdio_write(uint addr, uint reg, uint val) {
 
 }
 
+uint32_t max_cmd = 5;
+
 // Get packet from pbuf, add CRC, put in DMA buffer for transmit
 static err_t netif_rmii_ethernet_output(struct netif *netif, struct pbuf *p) {
   uint32_t curr_cmd;
   uint32_t tx_next_pkt_ptr;
 
   // Test to see if there's space in the buffer for the packet
-  // Pbuf length does not include CRC bytes
-  uint32_t plen = p->tot_len + 4;
+  // Pbuf length does not include CRC bytes, nor pkt length bytes
+  uint32_t plen = p->tot_len + 4 + 2;
 
-  // Nor does it pad to minimum Ethernet frame size
-  if (plen < 64) plen = 64;
+  // Nor does it pad to minimum Ethernet frame size + pkt length bytes
+  if (plen < 66) plen = 66;
 
   // Make Tx read addr into ring buffer index
   uint32_t curr_rd = (dma_hw->ch[tx_dma_chan].read_addr) & TX_BUF_MASK;
@@ -673,9 +705,14 @@ static err_t netif_rmii_ethernet_output(struct netif *netif, struct pbuf *p) {
 		      (tx_buf_wrap ? ((curr_rd - curr_wr) & TX_BUF_MASK) :
 		       (curr_wr - curr_rd)));
 
-  // Wait for current packet to end, if we don't have enough free space
-  if (plen > tx_free) {
-    dma_channel_wait_for_finish_blocking(tx_dma_chan);
+  // Wait for space in buffer
+  while (plen > tx_free) {
+    sleep_us(10);
+    curr_rd = (dma_hw->ch[tx_dma_chan].read_addr) & TX_BUF_MASK;
+    tx_buf_wrap = (curr_rd ^ curr_wr) & TX_BUF_MASK;
+    tx_free = (TX_BUF_SIZE -
+	       (tx_buf_wrap ? ((curr_rd - curr_wr) & TX_BUF_MASK) :
+		(curr_wr - curr_rd)));
   }
 
   // Push frame into ring buffer
@@ -684,78 +721,74 @@ static err_t netif_rmii_ethernet_output(struct netif *netif, struct pbuf *p) {
   // Bump frame ring buffer addr
   tx_addr = (tx_addr + len) & TX_BUF_MASK;
 
-  // Handle idle case and active case seperately, even if there's
-  // some redundancy
-  // Idle:
-  //   Update command ring write pointer from DMA read pointer
-  //   Write into command ring, update write pointer
-  //   Start command ring DMA
-  // Active:
-  //   Write into command ring, update write pointer
+#ifdef CMD_PKT_DEBUG
+  // Get current cmd read and cmd write pointers
+  curr_cmd = ((dma_hw->ch[tx_chain_chan].read_addr) >> 2) & TX_NUM_MASK;
+  tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
 
-  if (!dma_channel_is_busy(tx_dma_chan) &&
-      !dma_channel_is_busy(ipg_dma_chan)) {
-    // Update tx current packet pointer from command pointer
-    // Command pointer will be advanced to EOC NULL when at end of cmds
-    // one beyond last tx_curr_ptk_ptr
+  // Compute number of items in command buffer, including EOC
+  tx_buf_wrap = (tx_next_pkt_ptr ^ curr_cmd) & TX_NUM_MASK;
+  tx_free = (tx_buf_wrap ? ((tx_next_pkt_ptr - curr_cmd) & TX_NUM_MASK) :
+	     (tx_next_pkt_ptr - curr_cmd));
 
-    // Update ptk ptr only if we're really idle: not transmitting, nor in IPG
-    curr_cmd = (dma_channel_hw_addr(tx_chain_chan)->read_addr);
-    tx_curr_pkt_ptr = (curr_cmd >> 2) & TX_NUM_MASK;
-
-    // Generate next packet pointer
-    tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
-
-    // Put end of commands (EOC) into command ring, after new command
-    tx_pkt_ptr[tx_next_pkt_ptr] = 0;
-
-    // Write new command into cmd ring buffer
-    tx_pkt_ptr[tx_curr_pkt_ptr] = len;
-
-    // Bump command ring buffer address
-    tx_curr_pkt_ptr = tx_next_pkt_ptr;
-
-    // Trigger command DMA
-    dma_channel_hw_addr(tx_chain_chan)->al1_transfer_count_trig = 1;
-      
-  } else {
-    // DMA active
-    // Generate next packet pointer
-    tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
-
-    // Put end of commands (EOC) into command ring, after new command
-    // Do this now, in case data channel DMA triggers while we're 
-    // writing new cmd below
-    tx_pkt_ptr[tx_next_pkt_ptr] = 0;
-
-    // Write new command into cmd ring buffer
-    tx_pkt_ptr[tx_curr_pkt_ptr] = len;
-      
-    // Make sure DMA is still active, so that we know
-    // the command will be picked up
-    if (!dma_channel_is_busy(tx_dma_chan)) {
-      // Uh oh, data isn't transmitting
-      if (!dma_channel_is_busy(ipg_dma_chan)) {
-	// And neither is IPG!
-	// Did command already execute?
-	// Get current read pointer, compare to write
-	curr_cmd = (dma_channel_hw_addr(tx_chain_chan)->read_addr);
-	curr_cmd = (curr_cmd >> 2) & TX_NUM_MASK;
-	if (curr_cmd == tx_next_pkt_ptr) {
-	  // Nope, trigger it
-	  dma_channel_hw_addr(tx_chain_chan)->al3_read_addr_trig =
-	    (uint32_t)&(tx_pkt_ptr[tx_curr_pkt_ptr]);
-	}
-      }
-    }
-
-    // Bump command ring buffer address
-    tx_curr_pkt_ptr = tx_next_pkt_ptr;
+  if (tx_free > max_cmd) {
+    printf("%d ", tx_free);
+    max_cmd = tx_free;
   }
+#endif
+
+  // Insert new packet into command list, saving DMA status before/after
+  // Generate next packet pointer for EOC (cmd write)
+  tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
+
+  // Put end of commands (EOC) into command ring, after new command
+  tx_pkt_ptr[tx_next_pkt_ptr] = 0;
+
+  // Write new command into cmd ring buffer, with interrupts disabled
+  uint32_t irq_save = save_and_disable_interrupts();
+  uint32_t before_stat = dma_channel_is_busy(tx_dma_chan);
+  tx_pkt_ptr[tx_curr_pkt_ptr] = len;
+  uint32_t after_stat = dma_channel_is_busy(tx_dma_chan);
+
+  // Sample busy again if we were busy before and not now
+  // This catches the packet DMA idle between chained DMAs case
+  if (before_stat && !after_stat) {
+    sleep_us(1);
+    after_stat = dma_channel_is_busy(tx_dma_chan);
+  }
+  restore_interrupts(irq_save);
+
+  // Check to see if new command will be executed
+  // Case 1: DMA busy before/busy after -> yes, nothing needs to be done
+  // Case 2: DMA not busy before/not busy after -> no, start cmd queue DMA
+  // Case 3: DMA busy before/not busy after -> no, start cmd queue DMA
+  // Case 4: DMA not busy before/busy after -> yes, nothing needs to be done
+
+  // Handle case 3
+  // Occurs if we hit the idle time between chained DMAs
+  // In this case, the DMA should start up when the chain is completed
+  // Hopefully, this will mitigated by the double sampling done above
+  if (before_stat && !after_stat) {
+    sleep_us(1);
+    // Start cmds, only if it really is idle (not likely)
+    if (!dma_channel_is_busy(tx_dma_chan)) {
+      dma_channel_hw_addr(tx_chain_chan)->al3_read_addr_trig =
+	  (uint32_t)&(tx_pkt_ptr[tx_curr_pkt_ptr]);
+    }
+  }
+  
+  // Handle case 2
+  // Startup when really idle
+  if (!before_stat && !after_stat) {
+    dma_channel_hw_addr(tx_chain_chan)->al3_read_addr_trig =
+      (uint32_t)&(tx_pkt_ptr[tx_curr_pkt_ptr]);
+  }
+
+  // Bump command ring buffer address
+  tx_curr_pkt_ptr = tx_next_pkt_ptr;
 
   return ERR_OK;
 }
-
 
 // Do end of received packet processing
 // Time critical - must be in SRAM, otherwise we get CRC errors
@@ -763,14 +796,11 @@ static void __not_in_flash_func(netif_rmii_ethernet_eof_isr)() {
   uint32_t prev_rx_addr;
   uint32_t rx_packet_byte_count;
 
-  // Clear PIO received packet flag
-  pio_interrupt_clear(PICO_RMII_ETHERNET_PIO, 0);
-
   // Save old write address (aka start of current packet)
   prev_rx_addr = rx_addr;
 
   // Save new write address (aka start of next packet)
-  rx_addr = dma_hw->ch[rx_dma_chan].write_addr - (uint32_t)(&rx_ring[0]);
+  rx_addr = (uint32_t)dma_hw->ch[rx_dma_chan].write_addr-(uint32_t)&rx_ring[0];
 
   // Do wrapped length calc
   if (rx_addr < prev_rx_addr) {
@@ -779,12 +809,18 @@ static void __not_in_flash_func(netif_rmii_ethernet_eof_isr)() {
     rx_packet_byte_count = rx_addr - prev_rx_addr;
   }
 
-  // Save start/len in packet pointer ring buffer
-  rx_pkt_ptr[rx_curr_pkt_ptr].pkt_addr = prev_rx_addr;
-  rx_pkt_ptr[rx_curr_pkt_ptr].pkt_len = rx_packet_byte_count;
+  // Only save packets with good length
+  if ((rx_packet_byte_count > 63) && (rx_packet_byte_count < 1519)) {
+    // Save start/len in packet pointer ring buffer
+    rx_pkt_ptr[rx_curr_pkt_ptr].pkt_addr = prev_rx_addr;
+    rx_pkt_ptr[rx_curr_pkt_ptr].pkt_len = rx_packet_byte_count;
 
-  // Bump pointer
-  rx_curr_pkt_ptr = (rx_curr_pkt_ptr + 1) & RX_NUM_MASK;
+    // Bump pointer
+    rx_curr_pkt_ptr = (rx_curr_pkt_ptr + 1) & RX_NUM_MASK;
+  }
+
+  // Clear PIO received packet flag
+  pio_interrupt_clear(PICO_RMII_ETHERNET_PIO, 0);
 
 }
 
@@ -798,19 +834,37 @@ void arch_pico_init() {
   gpio_set_dir(PICO_RMII_ETHERNET_RST_PIN, GPIO_OUT);
 #endif
 
+#ifdef PICO_RMII_ETHERNET_PWR_PIN
+  // Turn off LAN8720a power
+  gpio_init(PICO_RMII_ETHERNET_PWR_PIN);
+  gpio_set_dir(PICO_RMII_ETHERNET_PWR_PIN, GPIO_OUT);
+  gpio_put(PICO_RMII_ETHERNET_PWR_PIN, 0);
+#endif
+
+#ifdef GENERATE_RMII_CLK
   // Set up system clock
+  //uint32_t target_clk = 100000000;
+  //uint32_t target_clk = 125000000; 
   //uint32_t target_clk = 150000000; 
   //uint32_t target_clk = 200000000;
   //uint32_t target_clk = 250000000;
-  uint32_t target_clk = 300000000;
+  //uint32_t target_clk = 300000000;
 
-  // Enable overclock, which needs a bit of a voltage boost
+  //set_sys_clock_khz(target_clk/1000, true);
+
+  // Enable a bit of a voltage boost when overclocking
   //vreg_set_voltage(VREG_VOLTAGE_1_10);
   //vreg_set_voltage(VREG_VOLTAGE_1_15);
-  vreg_set_voltage(VREG_VOLTAGE_1_20);
+  //vreg_set_voltage(VREG_VOLTAGE_1_20);
   //vreg_set_voltage(VREG_VOLTAGE_1_25);
   //vreg_set_voltage(VREG_VOLTAGE_1_30);
+  
+#else
+  // Must have 6 sysclks per RMII clock for sampling RMII bus properly
+  uint32_t target_clk = 300000000;
+  vreg_set_voltage(VREG_VOLTAGE_1_20);
   set_sys_clock_khz(target_clk/1000, true);
+#endif
 
 #ifdef EN_1V8
   // Set 1.8v threshold for I/O pads
@@ -818,60 +872,13 @@ void arch_pico_init() {
   *addr = PADS_BANK0_VOLTAGE_SELECT_VALUE_1V8 << PADS_BANK0_VOLTAGE_SELECT_LSB;
 #endif
 
-#ifdef GENERATE_RMII_CLK
-
-  // Setup to generate RMII clock from RP2XXX system clock
-  // Find which clk is connected to the retclk pin
-  uint gpclk = 0;
-  uint gpio = PICO_RMII_ETHERNET_RETCLK_PIN;
-  if      (gpio == 21) gpclk = clk_gpout0;
-  else if (gpio == 23) gpclk = clk_gpout1;
-  else if (gpio == 24) gpclk = clk_gpout2;
-  else if (gpio == 25) gpclk = clk_gpout3;
-
-#if 0
-  // Leaving this here for now, in case it's useful later
-
-  // Push clock phase out when operating at lower speeds.
-  // Must be done before clock initialized, according to the datasheet
-  if (target_clk == 150000000) {
-    clocks_hw->clk[gpclk].ctrl = 0x2 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
-  } else if (target_clk == 100000000) {
-    clocks_hw->clk[gpclk].ctrl = 0x1 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
-  } else {
-    clocks_hw->clk[gpclk].ctrl = 0x0 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
-  }
-#endif
-
-  // Configure clock output on retclk pin to be 50 MHz
-  float clk_50_div = target_clk/50000000.0;
-  clock_gpio_init(PICO_RMII_ETHERNET_RETCLK_PIN,
-		  CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS, clk_50_div);
-
-  // Enable 50% duty cycle for odd divisors
-  clocks_hw->clk[gpclk].ctrl |= CLOCKS_CLK_GPOUT0_CTRL_DC50_BITS;
-#else
-  // Make ret clk pin input
-  gpio_init(PICO_RMII_ETHERNET_RETCLK_PIN);
-  gpio_set_dir(PICO_RMII_ETHERNET_RETCLK_PIN, GPIO_IN);
-#endif // #ifdef GENERATE_RMII_CLK
-
   // Let clock settle
   sleep_ms(10);
 
   // Initialize stdio after the clock change
   // RP2XXX stdio initialization takes around 2 seconds
   stdio_init_all();
-  sleep_ms(1000);
-
-#ifdef PICO_RMII_ETHERNET_RST_PIN
-  // Deassert reset after a minimum of 25 ms with the RMII clock active
-  gpio_put(PICO_RMII_ETHERNET_RST_PIN, 1);
-  // Allow on-board pull up to hold reset high
-  gpio_set_dir(PICO_RMII_ETHERNET_RST_PIN, GPIO_IN);
-#endif
-
-  sleep_ms(1000);
+  sleep_ms(2000);
 
 }
 
@@ -884,17 +891,32 @@ void arch_pico_info(struct netif *netif) {
 
   printf("System clk: %4.2f MHz\n", (float)clock_get_hz(clk_sys)/1e6);
 
-  uint16_t dma_div = clock_get_hz(clk_sys)/12500000u;
-
-  printf("DMA div: %d\n", dma_div);
-
-
   printf("phy addr: %d\n", phy_address);
+
+#ifdef REPORT_BUF_SIZE
+  printf("rx buf start/end/size: %08x %08x %d\n", (uint32_t)&rx_ring[0],
+	 (uint32_t)&rx_ring[RX_BUF_MASK],
+	 (uint32_t)&rx_ring[RX_BUF_MASK] - (uint32_t)&rx_ring[0] + 1);	 
+
+  printf("rx ptr start/end/size: %08x %08x %d\n", (uint32_t)&rx_pkt_ptr[0],
+	 (uint32_t)&rx_pkt_ptr[RX_NUM_MASK],
+	 ((uint32_t)&rx_pkt_ptr[RX_NUM_MASK + 1] - (uint32_t)&rx_pkt_ptr[0])/
+	 sizeof(rx_pkt_ptr[0]));
+
+  printf("tx buf start/end/size: %08x %08x %d\n", (uint32_t)&tx_ring[0],
+	 (uint32_t)&tx_ring[TX_BUF_MASK],
+	 (uint32_t)&tx_ring[TX_BUF_MASK] - (uint32_t)&tx_ring[0] + 1);	 
+
+  printf("tx ptr start/end/size: %08x %08x %d\n", (uint32_t)&tx_pkt_ptr[0],
+	 (uint32_t)&tx_pkt_ptr[TX_NUM_MASK],
+	 ((uint32_t)&tx_pkt_ptr[TX_NUM_MASK + 1] - (uint32_t)&tx_pkt_ptr[0])/
+	 sizeof(tx_pkt_ptr[0]));
+#endif
 
 #ifdef GENERATE_RMII_CLK
   printf("Setup to generate RMII clock on GPIO %d\n",
 	 PICO_RMII_ETHERNET_RETCLK_PIN);
-#ifndef PICO_RMII_ETHERNET_RST_PIN
+#if !defined(PICO_RMII_ETHERNET_RST_PIN) && !defined(PICO_RMII_ETHERNET_PWR_PIN)
   printf("Warning: no GPIO controlled LAN8720a reset pin. Operation maybe erratic.\n");
 #endif
 #else
@@ -907,7 +929,13 @@ void arch_pico_info(struct netif *netif) {
 	 PICO_RMII_ETHERNET_RST_PIN);
 #endif
 
+#ifdef PICO_RMII_ETHERNET_PWR_PIN
+  printf("LAN8720a power pin connected to GPIO %d\n",
+	 PICO_RMII_ETHERNET_PWR_PIN);
+#endif
+
 }
+
 
 static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 
@@ -927,7 +955,6 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 #else
   // Generate MAC from unique board id
   pico_unique_board_id_t board_id;
-    
   pico_get_unique_board_id(&board_id);
 
   // Set default MAC identifier to Raspberry Pi Foundation
@@ -939,6 +966,11 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 
   netif->hwaddr_len = ETH_HWADDR_LEN;
 
+  // Init TX command buffer
+  for (int i = 0; i < TX_NUM_PTR; i++) {
+    tx_pkt_ptr[i] = 0;
+  }
+
   // Init the RMII PIO programs
   rx_sm_offset = pio_add_program(PICO_RMII_ETHERNET_PIO,
 				 &rmii_ethernet_phy_rx_data_program);
@@ -949,20 +981,17 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   rx_dma_chan = dma_claim_unused_channel(true);
   rx_chain_chan = dma_claim_unused_channel(true);
   tx_dma_chan = dma_claim_unused_channel(true);
-  ipg_dma_chan = dma_claim_unused_channel(true);
   tx_chain_chan = dma_claim_unused_channel(true);
 
   // Reset them
   dma_channel_abort(rx_dma_chan);
   dma_channel_abort(rx_chain_chan);
   dma_channel_abort(tx_dma_chan);
-  dma_channel_abort(ipg_dma_chan);
   dma_channel_abort(tx_chain_chan);
 
   dma_channel_hw_addr(rx_dma_chan)->al1_ctrl = 0;
   dma_channel_hw_addr(rx_chain_chan)->al1_ctrl = 0;
   dma_channel_hw_addr(tx_dma_chan)->al1_ctrl = 0;
-  dma_channel_hw_addr(ipg_dma_chan)->al1_ctrl = 0;
   dma_channel_hw_addr(tx_chain_chan)->al1_ctrl = 0;
 
   // Get default config for RX receive channel
@@ -995,9 +1024,12 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
      &rx_ring[0],
      // PIO fills upper byte of RX FIFO
      ((uint8_t*)&PICO_RMII_ETHERNET_PIO->rxf[PICO_RMII_ETHERNET_SM_RX]) + 3,
-     1500, // Arbitrary - will be updated by reload DMA 
+     RX_BUF_SIZE * 16, // Arbitrary - just keep filling the ring
      false
      );
+
+  // Save the channel config, with EN asserted, for the chain reload value
+  rx_ctl_reload = dma_hw->ch[rx_dma_chan].al1_ctrl | DMA_CH0_CTRL_TRIG_EN_BITS;
 
   // Get default config for chain DMA channel
   // Defaults: 32 bit xfer, unpaced, no write inc, read inc, no chain
@@ -1010,8 +1042,8 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   channel_config_set_write_increment(&rx_chain_channel_config, false);
 
   dma_channel_configure(rx_chain_chan, &rx_chain_channel_config,
-			&dma_hw->ch[rx_dma_chan].al1_transfer_count_trig,
-			&rx_packet_size, // Contains default RX receive size
+			&dma_hw->ch[rx_dma_chan].ctrl_trig,
+			&rx_ctl_reload, // Contains control register reload
 			1,
 			false
 			);
@@ -1037,8 +1069,8 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   // Eight bit transfers
   channel_config_set_transfer_data_size(&tx_dma_channel_config, DMA_SIZE_8);
 
-  // Chain to the ipg channel
-  channel_config_set_chain_to(&tx_dma_channel_config, ipg_dma_chan);
+  // Chain to tx command channel
+  channel_config_set_chain_to(&tx_dma_channel_config, tx_chain_chan);
 
   // Setup the DMA to send the frame via the PIO RMII tansmitter
   dma_channel_configure(
@@ -1050,44 +1082,6 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 			false
 			);
 
-  // Get default config for IPG DMA channel
-  // Defaults: 32 bit xfer, unpaced, no write inc, read inc, no chain
-  ipg_dma_channel_config = dma_channel_get_default_config(ipg_dma_chan);
-
-  // Don't increment read/write addr
-  channel_config_set_read_increment(&ipg_dma_channel_config, false);
-  channel_config_set_write_increment(&ipg_dma_channel_config, false);
-
-  // Chain to tx command channel
-  channel_config_set_chain_to(&ipg_dma_channel_config, tx_chain_chan);
-
-  // Setup for Ethernet Inter Packet Gap (IPG), 960 ns minimum
-  uint32_t dma_timer = dma_claim_unused_timer(true);
-
-  // Setup DMA timer to tick over at Ethernet byte rate = 80ns (12.5 MHz)
-  // From dma.h: 
-  // The timer will run at the system_clock_freq * numerator / denominator
-  // For our use case, we assume integer fractional divider values, since
-  // the system clock must be an integer multiple of the RMII clock
-  // So, we can then make the numerator always 1, and compute a divider
-  uint16_t dma_div = clock_get_hz(clk_sys)/12500000u;
-  dma_timer_set_fraction(dma_timer, 1u, dma_div);
-
-  // Setup timer paced DMA
-  channel_config_set_dreq(&ipg_dma_channel_config,
-			  dma_get_timer_dreq(dma_timer));
-
-  // Write config, and enable it. Shouldn't ever need to touch again.
-  // Set length to 10 Ethernet byte times to allow TX FIFO to drain
-  // (8 for FIFO, 1 for PIO xmit, 1 for arbitration uncertainties)
-  // We snapshot the TX dma read address for buffer full estimation
-  dma_channel_configure(ipg_dma_chan, &ipg_dma_channel_config,
-			&ipg_tx_rd_addr, 
-			(uint32_t *)&(dma_hw->ch[tx_dma_chan].read_addr),
-			10, 
-			true
-			);
-
   // Get default config for TX chain DMA channel
   // Defaults: 32 bit xfer, unpaced, no write inc, read inc, no chain
   tx_chain_channel_config = dma_channel_get_default_config(tx_chain_chan);
@@ -1096,7 +1090,7 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   channel_config_set_read_increment(&tx_chain_channel_config, true);
 
   // Wrap read address on ring size byte boundary
-  channel_config_set_ring(&tx_chain_channel_config, false, TX_NUM_PTR_POW);
+  channel_config_set_ring(&tx_chain_channel_config, false, TX_NUM_PTR_POW_BYTES);
 
   // Write to single address, don't increment write address
   channel_config_set_write_increment(&tx_chain_channel_config, false);
@@ -1176,7 +1170,10 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   // Configure the RMII TX state machine
   rmii_ethernet_phy_tx_init(PICO_RMII_ETHERNET_PIO,
 			    PICO_RMII_ETHERNET_SM_TX,
+			    // Start of PIO program
 			    tx_sm_offset,
+			    // Pass in the TX pio entry point
+			    rmii_ethernet_phy_tx_data_offset_tx_start,
 			    PICO_RMII_ETHERNET_TX_PIN,
 			    PICO_RMII_ETHERNET_RETCLK_PIN,
 			    tx_div);
@@ -1187,6 +1184,20 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 			    rx_sm_offset,
 			    PICO_RMII_ETHERNET_RX_PIN,
 			    rx_div);
+
+#ifdef PICO_RMII_ETHERNET_RST_PIN
+  // Deassert reset after a minimum of 25 ms with the RMII clock active
+  sleep_ms(25);
+  //gpio_put(PICO_RMII_ETHERNET_RST_PIN, 1);
+  // Allow on-board pull up to hold reset high
+  gpio_set_dir(PICO_RMII_ETHERNET_RST_PIN, GPIO_IN);
+#endif
+
+#ifdef PICO_RMII_ETHERNET_PWR_PIN
+  // Enable power after RMII clock is running
+  // On-board reset should deassert after 25 ms
+  gpio_put(PICO_RMII_ETHERNET_PWR_PIN, 1);
+#endif
 
   // Add handler for PIO SM interrupt
   // We use PIO IRQ 0, which maps to system IRQ 7/9
@@ -1211,7 +1222,7 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   uint32_t pwm_slice_num = pwm_gpio_to_slice_num(PICO_RMII_ETHERNET_MDC_PIN);
 
   // Set PWM clock to 10 MHz
-  float div_10M = (float)clock_get_hz(clk_sys)/ 10000000;
+  float div_10M = (float)clock_get_hz(clk_sys)/10000000;
   pwm_config_set_clkdiv(&pwm_cnfg, div_10M);
 
   // Divide 10 MHz clock by 200 to get 50 kHz                           
@@ -1224,6 +1235,9 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
   // Setup MDIO pin
   gpio_init(PICO_RMII_ETHERNET_MDIO_PIN);
 
+  // Wait for LAN8720A to wake up
+  sleep_ms(100);
+
   // Get LAN8720A PHY address by looking for a response to reg 0
   for (int i = 0; i < 32; i++) {
     if (netif_rmii_ethernet_mdio_read(i, 0) != 0xffff) {
@@ -1234,10 +1248,12 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 
   if (phy_address == 0xffff) {
     printf("Failed to find a PHY register\n");
+    arch_pico_info(netif);
     return ERR_IF;
   }
    
-#if defined(GENERATE_RMII_CLK) && !defined(PICO_RMII_ETHERNET_RST_PIN)
+#if defined(GENERATE_RMII_CLK) && !defined(PICO_RMII_ETHERNET_RST_PIN) && !defined(PICO_RMII_ETHERNET_PWR_PIN)
+
   // Enable limited workaround for lack of PHY reset
   printf("Enabling no PHY reset pin mitigation\n");
 
@@ -1311,25 +1327,37 @@ err_t netif_rmii_ethernet_init(struct netif *netif) {
 }
 
 // Test the RX ring buffer for packets, send to LWIP if available
+absolute_time_t next_mdio_time = 0;
 void netif_rmii_ethernet_poll() {
   uint32_t rx_packet_count;
   uint32_t rx_packet_byte_count;
   uint32_t rx_packet_addr;
+  uint32_t deferred_read;
+  uint16_t link_status;
 
-  // Use non-blocking MDIO read to get link status
-  uint32_t deferred_read = netif_rmii_ethernet_mdio_read_nb(phy_address, 1);
-  if (deferred_read != -1) {
-    uint16_t link_status = (deferred_read & 0x04) >> 2;
-    if (netif_is_link_up(rmii_eth_netif) ^ link_status) {
-      if (link_status) {
-	// printf("netif_set_link_up\n");
-	netif_set_link_up(rmii_eth_netif);
-      } else {
-	// printf("netif_set_link_down\n");
-	netif_set_link_down(rmii_eth_netif);
+  // Test if time to read MDIO
+  absolute_time_t curr_time = get_absolute_time();
+  int64_t diff_time = absolute_time_diff_us(curr_time, next_mdio_time);
+  if (diff_time < 0) {
+    // Schedule next read
+    next_mdio_time = make_timeout_time_ms(500);
+
+    // Use non-blocking MDIO read to get link status
+    deferred_read = netif_rmii_ethernet_mdio_read_nb(phy_address, 1);
+    if (deferred_read != -1) {
+      link_status = (deferred_read & 0x04) >> 2;
+      if (netif_is_link_up(rmii_eth_netif) ^ link_status) {
+	if (link_status) {
+	  // printf("netif_set_link_up\n");
+	  netif_set_link_up(rmii_eth_netif);
+	} else {
+	  // printf("netif_set_link_down\n");
+	  netif_set_link_down(rmii_eth_netif);
+	}
       }
     }
   }
+
 
   // Get number of packets received since last poll
   // Read curr pkt ptr once, to avoid ISR updating while we're using it
@@ -1352,24 +1380,22 @@ void netif_rmii_ethernet_poll() {
     rx_prev_pkt_ptr = (rx_prev_pkt_ptr + 1) & RX_NUM_MASK;
     rx_packet_count--;
       
-    if (rx_packet_byte_count > 63) {
-      struct pbuf* p = pbuf_alloc(PBUF_RAW, rx_packet_byte_count, PBUF_POOL);
+    struct pbuf* p = pbuf_alloc(PBUF_RAW, rx_packet_byte_count, PBUF_POOL);
 
-      // Push packet from ring buffer into LWIP pbuf
-      uint32_t rx_len = ethernet_frame_to_pbuf(rx_ring,
-					       p,
-					       rx_packet_byte_count,
-					       rx_packet_addr);
+    // Push packet from ring buffer into LWIP pbuf
+    uint32_t rx_len = ethernet_frame_to_pbuf(rx_ring,
+					     p,
+					     rx_packet_byte_count,
+					     rx_packet_addr);
 
-      if (rmii_eth_netif->input(p, rmii_eth_netif) != ERR_OK) {
-	pbuf_free(p);
-      }
+    if (rmii_eth_netif->input(p, rmii_eth_netif) != ERR_OK) {
+      pbuf_free(p);
+    }
 
-      // Indicate CRC errors
-      if (rx_len == 0) {
-	printf("*");
-	pbuf_free(p);
-      }
+    // Indicate CRC errors
+    if (rx_len == 0) {
+      printf("*");
+      pbuf_free(p);
     }
   }
 
@@ -1379,5 +1405,7 @@ void netif_rmii_ethernet_poll() {
 void netif_rmii_ethernet_loop() {
   while (1) {
     netif_rmii_ethernet_poll();
+    //sleep_us(2);
   }
 }
+

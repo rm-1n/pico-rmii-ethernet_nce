@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-
+/*
 // GPIO assignments for DECSTATION2040
 .define public PICO_RMII_ETHERNET_SM_RX       1
 .define public PICO_RMII_ETHERNET_SM_TX       0
@@ -15,8 +15,8 @@
 .define public PICO_RMII_ETHERNET_MDIO_PIN    6
 .define public PICO_RMII_ETHERNET_MDC_PIN     7
 .define public PICO_RMII_ETHERNET_RETCLK_PIN 21
+*/
 
-/*
 // GPIO assignments from the original RMII code
 .define public PICO_RMII_ETHERNET_SM_RX       1
 .define public PICO_RMII_ETHERNET_SM_TX       0
@@ -25,7 +25,7 @@
 .define public PICO_RMII_ETHERNET_MDIO_PIN   14
 .define public PICO_RMII_ETHERNET_MDC_PIN    15
 .define public PICO_RMII_ETHERNET_RETCLK_PIN 21
-*/
+
 
 // Comment out to disable generation of MDIO clock
 .define public GENERATE_MDIO_CLK 0

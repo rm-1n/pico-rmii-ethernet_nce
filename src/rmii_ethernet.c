@@ -448,6 +448,8 @@ static void state_alpha(enum md_pin_states state) {
 // Interrupt service routine, called on falling edge of MD clock 
 // Pushes command bits during non MD_DATA states, read/writes during.
 // Note: MSB data is sent first
+// Guard to ensure callback only registered once (shared IRQ slots are limited)
+static bool mdio_irq_installed = false;
 static void netif_rmii_ethernet_mdc_falling() {
   uint32_t bit;
 
@@ -501,11 +503,10 @@ static void netif_rmii_ethernet_mdc_falling() {
     }
 
     if (md_state == MD_IDLE) {
-      // No more edges
-      gpio_set_irq_enabled_with_callback(PICO_RMII_ETHERNET_MDC_PIN, 
-					 GPIO_IRQ_EDGE_FALL, false, 
-					 netif_rmii_ethernet_mdc_falling);
-    } 
+      // No more edges - just disable notifications, leave callback registered
+      gpio_set_irq_enabled(PICO_RMII_ETHERNET_MDC_PIN,
+                            GPIO_IRQ_EDGE_FALL, false);
+    }
 
     // Get next state
     md_sm();
@@ -531,12 +532,19 @@ static void md_sm() {
     md_data = 0xffffffff;
     md_clocks = 32;
     md_pin_state = MD_WRITE;
-    gpio_set_irq_enabled_with_callback(PICO_RMII_ETHERNET_MDC_PIN, 
-				       GPIO_IRQ_EDGE_FALL, true, 
-				       netif_rmii_ethernet_mdc_falling);
+    // Ensure an ISR callback is registered only once
+    if (!mdio_irq_installed) {
+        gpio_set_irq_enabled_with_callback(PICO_RMII_ETHERNET_MDC_PIN,
+                                           GPIO_IRQ_EDGE_FALL,
+                                           true,
+                                           netif_rmii_ethernet_mdc_falling);
+        mdio_irq_installed = true;
+    }
+    // and now enable the interrupt edge events
+    gpio_set_irq_enabled(PICO_RMII_ETHERNET_MDC_PIN,
+                         GPIO_IRQ_EDGE_FALL, true);
     break;
 
-    // Done with preamble, start SOF
   case MD_PREAMB:
     md_state = MD_SOF;
     md_data = 0b01;
@@ -843,14 +851,14 @@ void arch_pico_init() {
 
 #ifdef GENERATE_RMII_CLK
   // Set up system clock
-  //uint32_t target_clk = 100000000;
+  uint32_t target_clk = 100000000;
   //uint32_t target_clk = 125000000; 
   //uint32_t target_clk = 150000000; 
   //uint32_t target_clk = 200000000;
   //uint32_t target_clk = 250000000;
   //uint32_t target_clk = 300000000;
 
-  //set_sys_clock_khz(target_clk/1000, true);
+  set_sys_clock_khz(target_clk/1000, true);
 
   // Enable a bit of a voltage boost when overclocking
   //vreg_set_voltage(VREG_VOLTAGE_1_10);
@@ -1346,13 +1354,13 @@ void netif_rmii_ethernet_poll() {
     deferred_read = netif_rmii_ethernet_mdio_read_nb(phy_address, 1);
     if (deferred_read != -1) {
       link_status = (deferred_read & 0x04) >> 2;
-      if (netif_is_link_up(rmii_eth_netif) ^ link_status) {
-	if (link_status) {
+    if (netif_is_link_up(rmii_eth_netif) ^ link_status) {
+      if (link_status) {
 	  // printf("netif_set_link_up\n");
-	  netif_set_link_up(rmii_eth_netif);
-	} else {
+        netif_set_link_up(rmii_eth_netif);
+      } else {
 	  // printf("netif_set_link_down\n");
-	  netif_set_link_down(rmii_eth_netif);
+        netif_set_link_down(rmii_eth_netif);
 	}
       }
     }
@@ -1395,7 +1403,6 @@ void netif_rmii_ethernet_poll() {
     // Indicate CRC errors
     if (rx_len == 0) {
       printf("*");
-      pbuf_free(p);
     }
   }
 

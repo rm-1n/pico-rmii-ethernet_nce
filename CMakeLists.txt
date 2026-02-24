@@ -109,13 +109,13 @@ target_link_libraries(pico_rmii_ethernet INTERFACE
   pico_lwip
 )
 
-add_subdirectory("examples/httpd")
-add_subdirectory("examples/lwiperf")
+# add_subdirectory("examples/httpd")
+# add_subdirectory("examples/lwiperf")
 
 # Enable running with flash at higher system clock frequencies
 pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
 target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
 
 # Apply to all apps
-pico_set_boot_stage2(pico_rmii_ethernet_lwiperf slower_boot2)
-pico_set_boot_stage2(pico_rmii_ethernet_httpd slower_boot2)
+# pico_set_boot_stage2(pico_rmii_ethernet_lwiperf slower_boot2)
+# pico_set_boot_stage2(pico_rmii_ethernet_httpd slower_boot2)

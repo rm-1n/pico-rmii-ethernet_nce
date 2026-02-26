@@ -20,7 +20,7 @@
 // GPIO assignments from the original RMII code
 .define public PICO_RMII_ETHERNET_SM_RX       1
 .define public PICO_RMII_ETHERNET_SM_TX       0
-.define public PICO_RMII_ETHERNET_RX_PIN      6 // rx pin start: RX0, RX1, CRS
+.define public PICO_RMII_ETHERNET_RX_PIN      18 // rx pin start: RX0, RX1, CRS
 .define public PICO_RMII_ETHERNET_TX_PIN     10 // tx pin start: TX0, TX1, TX-EN
 .define public PICO_RMII_ETHERNET_MDIO_PIN   14
 .define public PICO_RMII_ETHERNET_MDC_PIN    15
